@@ -1,0 +1,20 @@
+access:
+  repo_plugins:
+    ibfu: # 可以指定社区
+      - robot-atomgit-openeuler-label
+
+  plugins:
+    - name: robot-atomgit-openeuler-welcome
+      endpoint: http://localhost:8862/atomgit-hook
+      events:
+        - "Merge Request Hook"
+        - "Issue Hook"
+        - "pull_request_review_comment"
+    - name: robot-atomgit-openeuler-label
+      endpoint: http://localhost:7102/atomgit-hook
+      events:
+        - "pull_request_review_comment"
+        - "issues"
+        - "pull_requests"
+        - "issue_comment"
+        - "push"
