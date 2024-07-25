@@ -2,15 +2,19 @@ package options
 
 import (
 	"flag"
+	"net/http"
 )
 
 // ClientOptions holds options for interacting with Client.
 type ClientOptions struct {
-	TokenPath      string
-	TokenGenerator func() []byte
-	RepoCacheDir   string
-	CacheRepoOnPV  bool
-	HandlerPath    string
+	TokenPath       string
+	TokenGenerator  func() []byte
+	RepoCacheDir    string
+	CacheRepoOnPV   bool
+	HandlerPath     string
+	CacheEndpoint   string
+	CacheMaxRetries int
+	Handler         http.Handler
 }
 
 // NewClientOptions creates a ClientOptions with default values.

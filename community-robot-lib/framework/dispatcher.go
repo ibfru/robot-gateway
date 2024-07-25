@@ -1,27 +1,16 @@
 package framework
 
 import (
-	"io"
 	"net/http"
 	"sync"
 
 	"community-robot-lib/config"
-	sdk "git-platform-sdk"
+
 	"github.com/sirupsen/logrus"
 )
 
 const (
-	LogFieldOrg       = "org"
-	LogFieldRepo      = "repo"
-	LogFieldEventId   = "event_id"
-	LogFieldEventType = "event-type"
-	LogFieldPayload   = "payload"
-	logFieldURL       = "url"
-	logFieldAction    = "action"
-
 	UserAgentHeader = "Robot-Gateway-Access"
-
-	badRequestMessagePrefix = "400 Bad Request: "
 )
 
 type dispatcher struct {
@@ -37,64 +26,58 @@ type dispatcher struct {
 }
 
 func (d *dispatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	ge := parseRequest(w, r, d.hmac)
+	ge := d.h.reqHandler(w, r)
 	if ge == nil {
 		return
 	}
 
-	l := logrus.WithFields(ge.ConvertToMap())
+	lgr := logrus.WithFields(ge.CollectLogFiled())
 
-	if err := d.Dispatch(ge, l); err != nil {
-		l.WithError(err).Error()
-	}
+	d.Dispatch(ge, lgr)
 }
 
-func (d *dispatcher) Dispatch(event *sdk.GenericEvent, l *logrus.Entry) error {
-	if event.EventType < AccessEvent || event.EventType > PullRequestCommentEvent {
-		l.Debug("Ignoring unknown event type")
+func (d *dispatcher) Dispatch(event *GenericEvent, lgr *logrus.Entry) {
+	if event.EventType < AccessEvent || event.EventType > OtherEvent {
+		lgr.Error("Ignoring unknown event type")
 	} else {
-
 		d.wg.Add(1)
-		go d.handleEvent(event, l)
+		go d.handleEvent(event, lgr)
 	}
-
-	return nil
 }
 
 func (d *dispatcher) Wait() {
 	d.wg.Wait() // Handle remaining requests
 }
 
-var handlerList []GenericHandler
+var eventHandlerList []GenericHandlerFunc
 var once sync.Once
 
 // Event-Type Value
 const (
 	AccessEvent = iota
+	PushEvent
 	IssueEvent
 	PullRequestEvent
-	PushEvent
 	IssueCommentEvent
-	PullRequestReviewEvent
 	PullRequestCommentEvent
+	OtherEvent
 )
 
-func (d *dispatcher) initialClient() {
-	handlerList = []GenericHandler{
-		d.h.accessHandlers,
-		d.h.issueHandlers,
-		d.h.pullRequestHandler,
-		d.h.pushEventHandler,
-		d.h.issueCommentHandler,
-		d.h.reviewEventHandler,
-		d.h.reviewCommentEventHandler,
+func (h *handlers) indexEventHandler() {
+	// slice element order must same to Event-Type Value
+	eventHandlerList = []GenericHandlerFunc{
+		h.accessHandler,
+		h.pushCodeBranchTagHandler,
+		h.issueHandlers,
+		h.pullRequestHandler,
+		h.issueCommentHandler,
+		h.pullRequestCommentHandler,
+		h.otherHandler,
 	}
 }
 
-func GetClientInstance(d *dispatcher) *[]GenericHandler {
-	once.Do(d.initialClient)
-	return &handlerList
+func buildDispatcherHandler(h *handlers) {
+	once.Do(h.indexEventHandler)
 }
 
 func (d *dispatcher) getConfig() config.Config {
@@ -104,63 +87,13 @@ func (d *dispatcher) getConfig() config.Config {
 }
 
 // handleAccessEvent access robot handle request that come form webhook
-func (d *dispatcher) handleEvent(e *sdk.GenericEvent, l *logrus.Entry) {
+func (d *dispatcher) handleEvent(evt *GenericEvent, lgr *logrus.Entry) {
 	defer d.wg.Done()
 
-	fn := (*GetClientInstance(d))[e.EventType]
-	if err := fn(e, d.getConfig(), l); err != nil {
-		l.WithError(err).Error()
+	fn := eventHandlerList[evt.EventType]
+	if err := fn(evt, d.getConfig(), lgr); err != nil {
+		lgr.Error(err)
 	} else {
-		l.Info()
+		lgr.Info()
 	}
-}
-
-func parseRequest(w http.ResponseWriter, r *http.Request, getHmac func() []byte) *sdk.GenericEvent {
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			logrus.Warn("when webhook body close, error occurred:", err)
-		}
-	}(r.Body)
-
-	resp := func(code int, msg string) {
-		http.Error(w, msg, code)
-	}
-	ge := sdk.GenericEvent{}
-	var err error
-	ge.EventType, ge.EventName, err = sdk.GetEventType(&r.Header)
-	if err != nil {
-		resp(http.StatusBadRequest, badRequestMessagePrefix+err.Error())
-		return nil
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		resp(http.StatusInternalServerError, "500 Internal Server Error: Failed to read request body")
-		return nil
-	}
-
-	if ge.EventType == AccessEvent {
-
-		if ge.EventUUID, err = sdk.GetEventUUID(&r.Header); err != nil {
-			resp(http.StatusBadRequest, badRequestMessagePrefix+err.Error())
-			return nil
-		}
-
-		if err = sdk.AuthSign(&r.Header, &body, getHmac()); err != nil {
-			resp(http.StatusForbidden, "403 Forbidden: "+err.Error())
-			return nil
-		}
-
-		resp(http.StatusOK, "The request was accepted by access's robot, inform to webhook.")
-
-	} else {
-		if err = sdk.CheckUserAgent(&r.Header, UserAgentHeader); err != nil {
-			resp(http.StatusBadRequest, badRequestMessagePrefix+err.Error())
-			return nil
-		}
-	}
-
-	ge.Payload = body
-	return &ge
 }

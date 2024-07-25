@@ -33,5 +33,3 @@ require (
 	golang.org/x/sys v0.15.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-//replace git-platform-sdk v0.0.0-00010101000000-000000000000 => ../git-platform-sdk

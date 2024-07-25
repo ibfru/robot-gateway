@@ -2,43 +2,29 @@ package main
 
 import (
 	"bytes"
+	"community-robot-lib/config"
+	"community-robot-lib/framework"
+	"community-robot-lib/utils"
 	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"sync"
-	"time"
-
-	"community-robot-lib/config"
-	"community-robot-lib/framework"
-	sdk "git-platform-sdk"
-	"github.com/sirupsen/logrus"
 )
 
 const botName = "robot-atomgit-access"
 
-type iClient interface {
-}
-
 func newRobot() *robot {
-	return &robot{}
+	return &robot{hc: utils.NewHttpClient(3)}
 }
 
 type robot struct {
-	cli iClient
-}
-
-type accessDispatcher struct {
 	// ec is an http client used for dispatching events
 	// to external plugin services.
-	ec http.Client
+	hc *utils.HttpClient
 	// Tracks running handlers for graceful shutdown
 	wg sync.WaitGroup
-}
-
-var ad = accessDispatcher{
-	ec: *http.DefaultClient,
-	wg: sync.WaitGroup{},
 }
 
 func (bot *robot) NewConfig() config.Config {
@@ -53,24 +39,72 @@ func (bot *robot) getConfig(cfg config.Config) (*configuration, error) {
 }
 
 func (bot *robot) RegisterEventHandler(f framework.HandlerRegister) {
+	f.RegisterPreEventHandler(bot.handleRequest)
 	f.RegisterAccessHandler(bot.handleAccessEvent)
 }
 
-func (bot *robot) handleAccessEvent(e *sdk.GenericEvent, cfg config.Config, log *logrus.Entry) error {
-	c, ok := cfg.(*configuration)
+type ResJson struct {
+	Code    int                     `json:"code"`
+	Message string                  `json:"message"`
+	Event   *framework.GenericEvent `json:"event"`
+}
+
+func (bot *robot) handleRequest(w http.ResponseWriter, r *http.Request) *framework.GenericEvent {
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			logrus.Warn("when webhook body close, error occurred:", err)
+		}
+	}(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		logrus.Error("when webhook body to be read, error occurred:", err)
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://localhost:8890/1.json", bytes.NewBuffer(body))
+	if err != nil {
+		logrus.Error("when webhook body to be read, error occurred:", err)
+		return nil
+	}
+	req.Header = r.Header
+	var resBody ResJson
+	resStatusCode, err := bot.hc.DoWait(req, &resBody)
+	if err != nil {
+		return nil
+	}
+
+	if resStatusCode != http.StatusOK {
+		http.Error(w, resBody.Message, resStatusCode)
+		logrus.Error("service occurred error")
+		return nil
+	}
+
+	if resBody.Code != http.StatusOK {
+		http.Error(w, resBody.Message, 400)
+		logrus.Error("webhook request check error")
+		return nil
+	}
+
+	ge := resBody.Event
+	ge.SourcePayload = body
+	return ge
+}
+
+func (bot *robot) handleAccessEvent(evt *framework.GenericEvent, cnf config.Config, lgr *logrus.Entry) error {
+	c, ok := cnf.(*configuration)
 	if !ok {
 		return fmt.Errorf("can't convert to configuration")
 	}
 
-	endpoints := c.GetEndpoints(e.Org, e.Repo, e.EventName)
-	ad.dispatchToDownstreamRobot(endpoints, log, e)
+	endpoints := c.GetEndpoints(evt.Org, evt.Repo, evt.EventName)
+	bot.dispatchToDownstreamRobot(endpoints, lgr, evt)
 	return nil
 }
 
-func (d *accessDispatcher) dispatchToDownstreamRobot(endpoints []string, l *logrus.Entry, e *sdk.GenericEvent) {
+func (bot *robot) dispatchToDownstreamRobot(endpoints []string, lgr *logrus.Entry, evt *framework.GenericEvent) {
 
 	newReq := func(endpoint string) (*http.Request, error) {
-		payload, err := e.ConvertToBytes()
+		payload, err := evt.ConvertToBytes()
 		if err != nil {
 			return nil, err
 		}
@@ -79,75 +113,21 @@ func (d *accessDispatcher) dispatchToDownstreamRobot(endpoints []string, l *logr
 			return nil, err
 		}
 
-		req.Header.Set(sdk.WebhookUserAgentKey, framework.UserAgentHeader)
 		req.Header.Set("token", "111")
 		return req, nil
 	}
 
-	reqs := make([]*http.Request, 0, len(endpoints))
-
-	for _, endpoint := range endpoints {
-		if req, err := newReq(endpoint); err == nil {
-			reqs = append(reqs, req)
+	reqSize := len(endpoints)
+	for i := 0; i < reqSize; i++ {
+		if r, err := newReq(endpoints[i]); err == nil {
+			bot.wg.Add(1)
+			go func(req *http.Request) {
+				_, _ = bot.hc.DoSend(req)
+				bot.wg.Done()
+				fmt.Println("================>")
+			}(r)
 		} else {
-			l.WithError(err).WithField("endpoint", endpoint).Error("Error generating http request.")
+			lgr.WithField("endpoint", endpoints[i]).Error("Error generating http request.", err)
 		}
 	}
-
-	for _, req := range reqs {
-		d.wg.Add(1)
-
-		// concurrent action is sending request not generating it.
-		// so, generates requests first.
-		go func(req *http.Request) {
-			defer d.wg.Done()
-
-			if err := d.forwardTo(req); err != nil {
-				l.WithError(err).WithField("endpoint", req.URL.String()).Error("Error forwarding event.")
-			}
-		}(req)
-	}
-}
-
-func (d *accessDispatcher) forwardTo(req *http.Request) error {
-	resp, err := d.do(req)
-	if err != nil || resp == nil {
-		return err
-	}
-
-	defer func(Body io.ReadCloser) {
-		e := Body.Close()
-		if e != nil {
-			logrus.Warn("when access received downstream response body close, error occurred:", e)
-		}
-	}(resp.Body)
-
-	rb, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("response has status %q and body %q", resp.Status, string(rb))
-	}
-	return nil
-}
-
-func (d *accessDispatcher) do(req *http.Request) (resp *http.Response, err error) {
-	if resp, err = d.ec.Do(req); err == nil {
-		return
-	}
-
-	maxRetries := 4
-	backoff := 100 * time.Millisecond
-
-	for retries := 0; retries < maxRetries; retries++ {
-		time.Sleep(backoff)
-		backoff *= 2
-
-		if resp, err = d.ec.Do(req); err == nil {
-			break
-		}
-	}
-	return
 }
